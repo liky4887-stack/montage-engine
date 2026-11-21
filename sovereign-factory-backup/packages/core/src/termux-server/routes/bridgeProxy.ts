@@ -5,6 +5,9 @@ const UPSTREAM_HOST = '127.0.0.1';
 const UPSTREAM_PORT = parseInt(process.env.BRIDGE_UPSTREAM_PORT || '8787', 10);
 const router = Router();
 
+// 1. Use a keep-alive agent to prevent the socket from closing prematurely
+const agent = new http.Agent({ keepAlive: true, maxSockets: 5 });
+
 router.all('/bridge/*', (req: Request, res: Response) => {
   const stripped = req.originalUrl.replace(/^\/bridge/, '') || '/';
   
@@ -12,28 +15,32 @@ router.all('/bridge/*', (req: Request, res: Response) => {
   delete headers['host'];
   delete headers['connection'];
 
-  // Check the header directly instead of relying on req.body
   const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
 
   const proxyReq = http.request(
-    { host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: stripped, headers },
+    { host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: stripped, headers, agent },
     (proxyRes) => {
       res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
       proxyRes.pipe(res);
     }
   );
 
+  // 2. Handle errors on BOTH the incoming request and the proxy request
+  req.on('error', (err) => {
+    console.error('[Bridge Proxy Req Error]', err.message);
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(500).json({ error: 'client_request_error' });
+  });
+
   proxyReq.on('error', (err) => {
     console.error('[Bridge Proxy Error]', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'bridge_upstream_error' });
   });
 
-  // 1. If it's a file upload, pipe the raw stream
   if (isMultipart) {
+    // 3. Let pipe() handle the end of the stream automatically
     req.pipe(proxyReq);
-  } 
-  // 2. Otherwise handle it as JSON
-  else {
+  } else {
     if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
       const bodyData = JSON.stringify(req.body);
       headers['content-type'] = 'application/json';
