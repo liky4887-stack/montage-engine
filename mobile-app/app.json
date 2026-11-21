@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "ClipForge AI",
+    "slug": "clipforge-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "clipforge",
+    "userInterfaceStyle": "dark",
+    "platforms": ["ios", "android"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-web-browser",
+      "expo-splash-screen",
+      
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
