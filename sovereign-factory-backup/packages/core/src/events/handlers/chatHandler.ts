@@ -18,7 +18,7 @@ export function registerChatHandler(): void {
     const p = event.payload;
     log.info('chat.command.parsed', {
       correlation_id: p.correlation_id,
-      target_path: p.target_path ?? '/api/v0/chat/completion',
+      target_path: p.target_path ?? '/v1/chat/completions',
       prompt_preview: p.prompt.slice(0, 80),
       prompt_length: p.prompt.length,
     });
