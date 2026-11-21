@@ -5,58 +5,42 @@ const UPSTREAM_HOST = '127.0.0.1';
 const UPSTREAM_PORT = parseInt(process.env.BRIDGE_UPSTREAM_PORT || '8787', 10);
 const router = Router();
 
-router.options('/bridge/*', (_req: Request, res: Response) => {
-  res.setHeader('access-control-allow-origin', '*');
-  res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('access-control-allow-headers', '*');
-  res.sendStatus(204);
-});
-
 router.all('/bridge/*', (req: Request, res: Response) => {
   const stripped = req.originalUrl.replace(/^\/bridge/, '') || '/';
   
-  const headers: http.OutgoingHttpHeaders = {};
-  for (const [k, v] of Object.entries(req.headers)) {
-    if (k === 'host' || k === 'connection' || k === 'content-length') continue;
-    headers[k] = v as any;
-  }
-  headers['host'] = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
+  const headers = { ...req.headers };
+  delete headers['host'];
+  delete headers['connection'];
+
+  // Check the header directly instead of relying on req.body
+  const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
 
   const proxyReq = http.request(
     { host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: stripped, headers },
     (proxyRes) => {
-      res.status(proxyRes.statusCode || 502);
-      for (const [k, v] of Object.entries(proxyRes.headers)) {
-        if (v !== undefined && k.toLowerCase() !== 'access-control-allow-origin') {
-          res.setHeader(k, v as any);
-        }
-      }
-      res.setHeader('access-control-allow-origin', '*');
-      if (res.socket) res.socket.setNoDelay(true);
-      res.flushHeaders();
+      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
       proxyRes.pipe(res);
     }
   );
 
   proxyReq.on('error', (err) => {
     console.error('[Bridge Proxy Error]', err.message);
-    if (!res.headersSent) {
-      res.status(502).json({ ok: false, error: 'bridge_upstream_error', detail: err.message });
-    } else {
-      res.end();
-    }
+    if (!res.headersSent) res.status(502).json({ error: 'bridge_upstream_error' });
   });
 
-  // If Express parsed the JSON, send it as a string
-  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-    const bodyData = JSON.stringify(req.body);
-    headers['content-type'] = 'application/json';
-    headers['content-length'] = Buffer.byteLength(bodyData);
-    proxyReq.write(bodyData);
-    proxyReq.end();
-  } else {
-    // Otherwise (multipart), pipe the stream
+  // 1. If it's a file upload, pipe the raw stream
+  if (isMultipart) {
     req.pipe(proxyReq);
+  } 
+  // 2. Otherwise handle it as JSON
+  else {
+    if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+      const bodyData = JSON.stringify(req.body);
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(bodyData).toString();
+      proxyReq.write(bodyData);
+    }
+    proxyReq.end();
   }
 });
 
