@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import fastify from 'fastify';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
