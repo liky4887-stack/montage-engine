@@ -36,7 +36,7 @@ export default function RootLayout() {
   // Check for auth token and redirect to pair screen if missing
   useEffect(() => {
     async function checkAuth() {
-      const token = await AsyncStorage.getItem('accessToken');
+      const token = await AsyncStorage.getItem('accessToken_v2');
       const inAuthGroup = segments[0] === 'pair';
 
       if (!token && !inAuthGroup) {

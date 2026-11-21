@@ -18,7 +18,7 @@ router.all('/bridge/*', (req: Request, res: Response) => {
 
   const headers: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    if (k === 'host' || k === 'connection') continue;
+    if (k === 'host' || k === 'connection' || k === 'content-length') continue;
     headers[k] = v as any;
   }
   headers['host'] = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
@@ -48,15 +48,13 @@ router.all('/bridge/*', (req: Request, res: Response) => {
     }
   });
 
-  // CRITICAL FIX: Check if this is a file upload (multipart) or a JSON request
+  // For multipart, stream directly and let Node set chunked encoding
   const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
-
   if (isMultipart) {
-    // Stream the file directly to the engine without buffering
     req.pipe(proxyReq);
   } else {
-    // Handle standard JSON requests normally
-    let bodyBuffer: Buffer | undefined = undefined;
+    // For JSON, buffer and forward
+    let bodyBuffer: Buffer | undefined;
     if (Buffer.isBuffer(req.body)) {
       bodyBuffer = req.body;
     } else if (req.body && typeof req.body === 'object') {

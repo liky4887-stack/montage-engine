@@ -2,53 +2,57 @@ import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL || 'http://192.168.43.101:8790';
+const TOKEN_KEY = 'accessToken_v2';
 
 const client = axios.create({
   baseURL: API_BASE,
   timeout: 60000,
-  headers: { 'Content-Type': 'application/json' },
 });
 
 client.interceptors.request.use(async (config) => {
-  const token = await AsyncStorage.getItem('accessToken');
+  const token = await AsyncStorage.getItem(TOKEN_KEY);
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });
 
+client.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    if (error.response?.status === 401) {
+      await AsyncStorage.removeItem(TOKEN_KEY);
+    }
+    return Promise.reject(error);
+  }
+);
+
 export const api = {
-  // --- UI Stubs to prevent crashes ---
   async getProjects() {
-    return []; // Returns empty list for now
+    return [];
   },
 
-  // --- Engine & Bridge Connections ---
   async pair(code: string) {
-    // If we route through the bridge, we hit the bridge's auth
     const res = await client.post('/bridge/pair', { code });
     if (res.data.accessToken) {
-      await AsyncStorage.setItem('accessToken', res.data.accessToken);
+      await AsyncStorage.setItem(TOKEN_KEY, res.data.accessToken);
     }
-    return res.data;
-  },
-
-  async getCapabilities() {
-    const res = await client.get('/bridge/capabilities');
     return res.data;
   },
 
   async uploadVideo(fileUri: string) {
     const formData = new FormData();
+    // Ensure Android sees the file:// prefix
+    const uri = fileUri.startsWith('file://') ? fileUri : fileUri.replace('file:', 'file://');
+    
     formData.append('file', {
-      uri: fileUri,
+      uri: uri,
       name: 'video.mp4',
       type: 'video/mp4',
     } as any);
 
-    const res = await client.post('/bridge/uploads', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
+    // DO NOT manually set Content-Type: multipart/form-data
+    const res = await client.post('/bridge/uploads', formData);
     return res.data;
   },
 
