@@ -6,7 +6,6 @@ const UPSTREAM_PORT = parseInt(process.env.BRIDGE_UPSTREAM_PORT || '8787', 10);
 
 const router = Router();
 
-// CORS preflight — answered locally, not forwarded.
 router.options('/bridge/*', (_req: Request, res: Response) => {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
@@ -14,23 +13,18 @@ router.options('/bridge/*', (_req: Request, res: Response) => {
   res.sendStatus(204);
 });
 
-// Catch-all: forward /bridge/<suffix> to http://127.0.0.1:8787/<suffix>
 router.all('/bridge/*', (req: Request, res: Response) => {
   const stripped = req.originalUrl.replace(/^\/bridge/, '') || '/';
-  const targetPath = stripped === '/health' ? '/health' : ('/api/bridge' + stripped);
 
   const headers: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    if (k === 'host' || k === 'content-length' || k === 'connection') continue;
+    if (k === 'host' || k === 'connection') continue;
     headers[k] = v as any;
   }
   headers['host'] = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
 
-  const body = Buffer.isBuffer(req.body) ? req.body : undefined;
-  if (body && body.length) headers['content-length'] = String(body.length);
-
   const proxyReq = http.request(
-    { host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: targetPath, headers },
+    { host: UPSTREAM_HOST, port: UPSTREAM_PORT, method: req.method, path: stripped, headers },
     (proxyRes) => {
       res.status(proxyRes.statusCode || 502);
       for (const [k, v] of Object.entries(proxyRes.headers)) {
@@ -39,7 +33,6 @@ router.all('/bridge/*', (req: Request, res: Response) => {
         }
       }
       res.setHeader('access-control-allow-origin', '*');
-      // Disable Nagle for SSE — do not buffer small chunks.
       if (res.socket) res.socket.setNoDelay(true);
       res.flushHeaders();
       proxyRes.pipe(res);
@@ -47,6 +40,7 @@ router.all('/bridge/*', (req: Request, res: Response) => {
   );
 
   proxyReq.on('error', (err) => {
+    console.error('[Bridge Proxy Error]', err.message);
     if (!res.headersSent) {
       res.status(502).json({ ok: false, error: 'bridge_upstream_error', detail: err.message });
     } else {
@@ -54,8 +48,27 @@ router.all('/bridge/*', (req: Request, res: Response) => {
     }
   });
 
-  if (body && body.length) proxyReq.write(body);
-  proxyReq.end();
+  // CRITICAL FIX: Check if this is a file upload (multipart) or a JSON request
+  const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
+
+  if (isMultipart) {
+    // Stream the file directly to the engine without buffering
+    req.pipe(proxyReq);
+  } else {
+    // Handle standard JSON requests normally
+    let bodyBuffer: Buffer | undefined = undefined;
+    if (Buffer.isBuffer(req.body)) {
+      bodyBuffer = req.body;
+    } else if (req.body && typeof req.body === 'object') {
+      bodyBuffer = Buffer.from(JSON.stringify(req.body));
+    }
+    if (bodyBuffer && bodyBuffer.length) {
+      headers['content-length'] = String(bodyBuffer.length);
+      headers['content-type'] = 'application/json';
+      proxyReq.write(bodyBuffer);
+    }
+    proxyReq.end();
+  }
 });
 
 export default router;
