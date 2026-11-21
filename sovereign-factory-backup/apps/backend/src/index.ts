@@ -1,0 +1,390 @@
+/**
+ * apps/backend/src/index.ts
+ * Unified entrypoint for the Sovereign Factory.
+ *
+ * Boots:
+ *   1. Canonical Truth Ledger (packages/core/src/ledger)
+ *   2. Canonical Orchestrator (packages/core/src/orchestrator) on 8791
+ *   3. Canonical Bridge HTTP server (packages/core/src/termux-server) on 8790
+ *   4. DeepSeek bridge (packages/core/src/deepseek) mounted at /deepseek/*
+ *
+ * Engines (fusion, persona, scout, sim, sales) are copied into
+ * packages/core/src/engines but are NOT yet mounted here. Wiring them
+ * is a follow-up task pending import-path verification. See MERGE_LOG.md.
+ */
+
+import { existsSync, readFileSync } from 'node:fs';
+
+import { config } from '../../../packages/core/src/config';
+import { log } from '../../../packages/core/src/shared/logger';
+import { LedgerService } from '../../../packages/core/src/ledger/api/LedgerService';
+import { JsonlLedgerRepository } from '../../../packages/core/src/ledger/storage/JsonlLedgerRepository';
+import { ProjectService } from '../../../packages/core/src/projects/api/ProjectService';
+import { JsonProjectRepository } from '../../../packages/core/src/projects/storage/JsonProjectRepository';
+import { TaskService } from '../../../packages/core/src/tasks/api/TaskService';
+import { JsonTaskRepository } from '../../../packages/core/src/tasks/storage/JsonTaskRepository';
+import { AgentService } from '../../../packages/core/src/agents/api/AgentService';
+import { JsonAgentRepository } from '../../../packages/core/src/agents/storage/JsonAgentRepository';
+import { GoalService } from '../../../packages/core/src/goals/api/GoalService';
+import { JsonGoalRepository } from '../../../packages/core/src/goals/storage/JsonGoalRepository';
+import { OfferService } from '../../../packages/core/src/offers/api/OfferService';
+import { JsonOfferRepository } from '../../../packages/core/src/offers/storage/JsonOfferRepository';
+import { SystemPowerService } from '../../../packages/core/src/system-power/api/SystemPowerService';
+import { JsonSystemPowerRepository } from '../../../packages/core/src/system-power/storage/JsonSystemPowerRepository';
+import { GodModeService } from '../../../packages/core/src/god-mode/api/GodModeService';
+import { MysticRealmService } from '../../../packages/core/src/mystic-realm/api/MysticRealmService';
+import { JsonSoulRepository } from '../../../packages/core/src/mystic-realm/storage/JsonSoulRepository';
+import { IdeService } from '../../../packages/core/src/ide/api/IdeService';
+import { JsonIdeRepository } from '../../../packages/core/src/ide/storage/JsonIdeRepository';
+import { TermuxBridgeServer } from '../../../packages/core/src/termux-server/TermuxBridgeServer';
+import { TermuxBridgeClient } from '../../../packages/core/src/clients/TermuxBridgeClient';
+import { TruthLedgerClient } from '../../../packages/core/src/clients/TruthLedgerClient';
+import { Orchestrator } from '../../../packages/core/src/orchestrator/Orchestrator';
+import { OrchestratorHttpServer } from '../../../packages/core/src/orchestrator/http/OrchestratorHttpServer';
+
+import { InMemoryCredentialStore } from '../../../packages/core/src/deepseek/storage/InMemoryCredentialStore';
+import { PowSolver } from '../../../packages/core/src/deepseek/pow/PowSolver';
+import { DeepSeekService } from '../../../packages/core/src/deepseek/api/DeepSeekService';
+import { CredentialsFileShape } from '../../../packages/core/src/deepseek/models/DeepSeekTypes';
+import { UEB, registerTermuxHandler, registerChatHandler, registerChatPersistHandler, registerChatIntentRouter, registerMysticHandler, registerGodModeHandler, registerWorkspaceHandler, registerLedgerHandler, registerMissionHandler, registerResultHandlers } from '../../../packages/core/src/events';
+import { ChatService } from '../../../packages/core/src/chat/api/ChatService';
+import { ProjectFileStorage } from '../../../packages/core/src/projects/builder/ProjectFileStorage';
+import { ProjectBuilder } from '../../../packages/core/src/projects/builder/ProjectBuilder';
+import { SkillLoader } from '../../../packages/core/src/skills/SkillLoader';
+import { GitHubService } from '../../../packages/core/src/github/api/GitHubService';
+import { QwenService } from '../../../packages/core/src/qwen/api/QwenService';
+import { QwenCredentialStore } from '../../../packages/core/src/qwen/storage/QwenCredentialStore';
+import { KimiService } from '../../../packages/core/src/kimi/api/KimiService';
+import { KimiCredentialStore } from '../../../packages/core/src/kimi/storage/KimiCredentialStore';
+import { DeepHatService } from '../../../packages/core/src/deephat/api/DeepHatService';
+import { EngineRegistry } from '../../../packages/core/src/engines/EngineRegistry';
+import { TwinOrchestrator } from '../../../packages/core/src/engines/TwinOrchestrator';
+import { ENGINE_IDS } from '../../../packages/core/src/engines/LlmEngine';
+import { DeepSeekEngineAdapter } from '../../../packages/core/src/engines/adapters/DeepSeekEngineAdapter';
+import { JsonChatRepository } from '../../../packages/core/src/chat/storage/JsonChatRepository';
+import { GrokService } from '../../../packages/core/src/engines/grok/GrokService';
+import { GrokEngineAdapter } from '../../../packages/core/src/engines/grok/GrokEngineAdapter';
+import { GeminiService } from '../../../packages/core/src/engines/gemini/GeminiService';
+import { GeminiEngineAdapter } from '../../../packages/core/src/engines/gemini/GeminiEngineAdapter';
+import { ChatGptService } from '../../../packages/core/src/engines/chatgpt/ChatGptService';
+import { ChatGptEngineAdapter } from '../../../packages/core/src/engines/chatgpt/ChatGptEngineAdapter';
+
+async function main(): Promise<void> {
+  log.info('factory.boot.start', {
+    host: config.HOST,
+    bridgePort: config.BRIDGE_PORT,
+    orchestratorPort: config.ORCHESTRATOR_PORT,
+  });
+
+  // Ledger
+  const ledger = new LedgerService(new JsonlLedgerRepository(config.LEDGER_FILE));
+  await ledger.init();
+  const integrity = await ledger.verifyIntegrity();
+  if (!integrity.ok) {
+    log.error('factory.ledger.integrity_failed', { ...integrity });
+    process.exit(1);
+  }
+
+  // Domain services
+  const projects = new ProjectService(new JsonProjectRepository(config.PROJECTS_FILE));
+  const tasks = new TaskService(new JsonTaskRepository(config.TASKS_FILE));
+  const agents = new AgentService(new JsonAgentRepository(config.AGENTS_FILE));
+  const goals = new GoalService(new JsonGoalRepository(config.GOALS_FILE));
+  const offers = new OfferService(new JsonOfferRepository(config.OFFERS_FILE));
+  const systemPower = new SystemPowerService(new JsonSystemPowerRepository(config.SYSTEM_POWER_FILE));
+
+  // Wire SystemPower toggles to the Truth Ledger
+  systemPower.setLedgerAppend(async (entry) => {
+    await ledger.append({
+      type: entry.type,
+      source: entry.source,
+      payload: entry.payload,
+      tags: entry.tags,
+    });
+  });
+
+  const godMode = new GodModeService({ ledger, projects, tasks, agents });
+  const mysticRealm = new MysticRealmService({
+    ledger, projects, tasks, goals,
+    soulRepo: new JsonSoulRepository(config.SOUL_FILE),
+  });
+
+  const ide = new IdeService({
+    ledger,
+    repo: new JsonIdeRepository(config.BLUEPRINTS_FILE),
+  });
+
+  // Chat history service (persists to ~/sovereign-core-data/chat/sessions.json)
+  const chat = new ChatService(new JsonChatRepository(config.CHAT_FILE));
+
+  // Project builder: writes generated files to ~/sovereign-projects/
+
+  // ─── DeepSeek bridge ─────────────────────────────────────────────────
+  const deepseekCreds = new InMemoryCredentialStore();
+  const deepseekPow = new PowSolver(config.DEEPSEEK.wasmPath);
+  const deepseek = new DeepSeekService(deepseekCreds, deepseekPow, {
+    baseUrl: config.DEEPSEEK.baseUrl,
+    defaultTargetPath: config.DEEPSEEK.defaultTargetPath,
+    defaultModel: config.DEEPSEEK.defaultModel,
+    requestTimeoutMs: config.DEEPSEEK.requestTimeoutMs,
+    pathTokenTtlSafetyMs: config.DEEPSEEK.pathTokenTtlSafetyMs,
+  });
+
+  // Project builder — writes generated files to ~/sovereign-projects/
+  const projectStorage = new ProjectFileStorage(config.PROJECTS_DIR);
+  const skillLoader = new SkillLoader({
+    repos: config.SKILLS_REPOS,
+    branch: config.SKILLS_BRANCH,
+    token: config.SKILLS_TOKEN,
+    cacheFile: config.SKILLS_CACHE_FILE,
+    cacheTtlMs: config.SKILLS_CACHE_TTL_MS,
+    maxTotalBytes: config.SKILLS_MAX_BYTES,
+    localDir: config.SKILLS_LOCAL_DIR,
+  });
+  const projectBuilder = new ProjectBuilder(deepseek, projectStorage, skillLoader);
+
+  // GitHub publisher — credentials auto-loaded from disk on construct.
+  const github = new GitHubService(config.GITHUB.credentialsFile);
+
+  // ─── Qwen engine (twin to DeepSeek) ─────────────────────────────────
+  const qwenCreds = new QwenCredentialStore(config.QWEN.credentialsFile);
+  const qwen = new QwenService(qwenCreds, {
+    baseUrl: config.QWEN.baseUrl,
+    defaultTargetPath: config.QWEN.defaultTargetPath,
+    defaultModel: config.QWEN.defaultModel,
+    requestTimeoutMs: config.QWEN.requestTimeoutMs,
+    credentialsFile: config.QWEN.credentialsFile,
+  });
+
+  // ─── Engine registry + twin orchestrator ────────────────────────────
+  const engineRegistry = new EngineRegistry();
+  engineRegistry.register(new DeepSeekEngineAdapter(deepseek));
+  engineRegistry.register(qwen);
+  // ─── Kimi engine (cookie-only, Invisible Man throttle) ───────
+  const kimiCreds = new KimiCredentialStore(config.KIMI.credentialsFile);
+  const kimi = new KimiService(kimiCreds, {
+    baseUrl: config.KIMI.baseUrl,
+    defaultTargetPath: config.KIMI.defaultTargetPath,
+    defaultModel: config.KIMI.defaultModel,
+    requestTimeoutMs: config.KIMI.requestTimeoutMs,
+    credentialsFile: config.KIMI.credentialsFile,
+    minRequestGapSeconds: config.KIMI.minRequestGapSeconds,
+    maxRequestsPerDay: config.KIMI.maxRequestsPerDay,
+    concurrencyLimit: config.KIMI.concurrencyLimit,
+    defaultDeviceId: config.KIMI.defaultDeviceId,
+    defaultSessionId: config.KIMI.defaultSessionId,
+    defaultTrafficId: config.KIMI.defaultTrafficId,
+    defaultTimezone: config.KIMI.defaultTimezone,
+    defaultShieldData: config.KIMI.defaultShieldData,
+  });
+  engineRegistry.register(kimi);
+
+  const grok = new GrokService({
+    baseUrl: config.XAI.baseUrl,
+    defaultModel: config.XAI.defaultModel,
+    requestTimeoutMs: config.XAI.requestTimeoutMs,
+    credentialsFile: config.XAI.credentialsFile,
+  });
+  engineRegistry.register(new GrokEngineAdapter(grok));
+
+  const gemini = new GeminiService({
+    baseUrl: config.GEMINI.baseUrl,
+    defaultModel: config.GEMINI.defaultModel,
+    requestTimeoutMs: config.GEMINI.requestTimeoutMs,
+    credentialsFile: config.GEMINI.credentialsFile,
+  });
+  engineRegistry.register(new GeminiEngineAdapter(gemini));
+
+  // ─── ChatGPT engine (cookie-based, chatgpt.com) ────────────────
+  const chatgpt = new ChatGptService({
+    baseUrl: config.CHATGPT.baseUrl,
+    defaultModel: config.CHATGPT.defaultModel,
+    requestTimeoutMs: config.CHATGPT.requestTimeoutMs,
+  });
+  engineRegistry.register(new ChatGptEngineAdapter(chatgpt));
+
+  try {
+    if (existsSync(config.CHATGPT.credentialsFile)) {
+      const raw = JSON.parse(readFileSync(config.CHATGPT.credentialsFile, 'utf8'));
+      if (raw.cookies) {
+        chatgpt.setCredentials({ cookies: raw.cookies });
+        log.info('chatgpt.credentials.loaded_from_file', { path: config.CHATGPT.credentialsFile });
+      }
+    }
+  } catch (e) {
+    log.warn('chatgpt.credentials.file_unreadable', { error: e instanceof Error ? e.message : String(e) });
+  }
+
+  try {
+    if (existsSync(config.XAI.credentialsFile)) {
+      const raw = JSON.parse(readFileSync(config.XAI.credentialsFile, 'utf8'));
+      if (raw.cookies) {
+        grok.setCredentials({
+          cookies: raw.cookies,
+          bearerToken: typeof raw.bearerToken === 'string' ? raw.bearerToken : '',
+          csrfToken: raw.csrfToken,
+          extraHeaders: raw.extraHeaders,
+        });
+        log.info('grok.credentials.loaded_from_file', { path: config.XAI.credentialsFile });
+      }
+    }
+  } catch (e) {
+    log.warn('grok.credentials.file_unreadable', { error: e instanceof Error ? e.message : String(e) });
+  }
+  try {
+    if (existsSync(config.GEMINI.credentialsFile)) {
+      const raw = JSON.parse(readFileSync(config.GEMINI.credentialsFile, 'utf8'));
+      if (raw.cookies && raw.atToken) {
+        gemini.setCredentials({
+          cookies: raw.cookies,
+          atToken: raw.atToken,
+          extraHeaders: raw.extraHeaders,
+        });
+        log.info('gemini.credentials.loaded_from_file', { path: config.GEMINI.credentialsFile });
+      }
+    }
+  } catch (e) {
+    log.warn('gemini.credentials.file_unreadable', { error: e instanceof Error ? e.message : String(e) });
+  }
+
+  // ─── DeepHat engine (cookie gateway on 8089) ───────────────
+  const deephatCredsFile = process.env.DEEPHAT_CREDS_FILE
+    || (process.env.HOME ? process.env.HOME + '/cookies/deephat-creds.json' : '');
+  const deephat = new DeepHatService({
+    baseUrl: process.env.DEEPHAT_GATEWAY_URL || 'http://127.0.0.1:8089',
+    requestTimeoutMs: 300_000,
+    credentialsFile: deephatCredsFile,
+  });
+  engineRegistry.register(deephat);
+  // Give ProjectBuilder the ability to route build requests through any
+  // registered engine (not just DeepSeek). Called once here, before the
+  // HTTP bridge starts accepting requests.
+  projectBuilder.setEngineResolver((id) => engineRegistry.get(id));
+
+  const twinOrchestrator = new TwinOrchestrator(
+    engineRegistry,
+    config.QWEN.primaryEngineId,
+    config.QWEN.enginePolicy,
+  );
+
+  // Boot-time credential loading (file takes precedence over env vars).
+  if (config.DEEPSEEK.credentialsFile && existsSync(config.DEEPSEEK.credentialsFile)) {
+    try {
+      const raw = JSON.parse(readFileSync(config.DEEPSEEK.credentialsFile, 'utf8')) as CredentialsFileShape;
+      if (raw.bearerToken && raw.cookies) {
+        deepseek.setCredentials({
+          bearerToken: raw.bearerToken,
+          cookies: raw.cookies,
+          hifLeim: raw.hifLeim,
+          hifDliq: raw.hifDliq,
+          deviceId: raw.deviceId,
+        });
+        log.info('deepseek.credentials.loaded_from_file', {
+          path: config.DEEPSEEK.credentialsFile,
+        });
+      } else {
+        log.warn('deepseek.credentials.file_missing_fields', {
+          path: config.DEEPSEEK.credentialsFile,
+        });
+      }
+    } catch (e) {
+      log.warn('deepseek.credentials.file_unreadable', {
+        path: config.DEEPSEEK.credentialsFile,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  } else if (config.DEEPSEEK.envBearerToken && config.DEEPSEEK.envCookies) {
+    deepseek.setCredentials({
+      bearerToken: config.DEEPSEEK.envBearerToken,
+      cookies: config.DEEPSEEK.envCookies,
+    });
+    log.info('deepseek.credentials.loaded_from_env');
+  } else {
+    log.info('deepseek.credentials.absent', {
+      hint: 'POST /deepseek/credentials to set them at runtime',
+    });
+  }
+
+  if (!deepseekPow.wasmExists()) {
+    log.warn('deepseek.pow.wasm_missing', { path: config.DEEPSEEK.wasmPath });
+  }
+
+  // Universal Event Bus — register handlers before HTTP boot
+  const commandRunner = new (require('../../../packages/core/src/termux-server/services/CommandRunner').CommandRunner)();
+  registerTermuxHandler(commandRunner);
+  registerChatHandler();
+  registerChatIntentRouter();
+  registerMysticHandler(mysticRealm);
+  registerGodModeHandler(godMode);
+  registerWorkspaceHandler();
+  registerLedgerHandler(ledger);
+  registerChatPersistHandler(chat);
+  registerMissionHandler(mysticRealm);
+  registerResultHandlers();
+  log.info('ueb.boot.ready', { handlers: ['termuxHandler', 'chatHandler', 'chatPersistHandler', 'chatIntentRouter', 'mysticHandler', 'godmodeHandler', 'workspaceHandler', 'ledgerHandler', 'missionHandler', 'resultHandlers'] });
+
+  // Bridge (8790)
+  const bridgeServer = new TermuxBridgeServer({
+    ledger,
+    projects,
+    tasks,
+    agents,
+    goals,
+    offers,
+    systemPower,
+    godMode,
+    mysticRealm,
+    ide,
+    deepseek,
+    chat,
+    projectBuilder,
+    projectStorage,
+    skillLoader,
+    github,
+    qwen,
+    kimi,
+    deephat,
+    engineRegistry,
+    twinOrchestrator,
+  });
+  await bridgeServer.start();
+
+  // Orchestrator (8791)
+  const base = `http://${config.HOST}:${config.BRIDGE_PORT}`;
+  const orchestrator = new Orchestrator({
+    bridge: new TermuxBridgeClient(base),
+    ledger: new TruthLedgerClient(base),
+    concurrency: 4,
+    maxQueueDepth: 100,
+  });
+  const orchestratorServer = new OrchestratorHttpServer({
+    orchestrator,
+    ledgerClient: new TruthLedgerClient(base),
+  });
+  await orchestratorServer.start();
+
+  log.info('factory.boot.ready', { bridge: base });
+
+  // Graceful shutdown
+  let stopping = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
+    log.info('factory.boot.shutdown', { signal });
+    try {
+      await orchestratorServer.stop(signal);
+      await bridgeServer.stop(signal);
+      await ledger.close();
+    } catch (err) {
+      log.error('factory.shutdown_error', { error: err instanceof Error ? err.message : String(err) });
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+main().catch((err) => {
+  console.error('FATAL', err);
+  process.exit(1);
+});

@@ -1,0 +1,68 @@
+# ─── Node / npm ───────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ─── Build / output (all frameworks) ──────────────────────────
+dist/
+build/
+out/
+.next/
+.nuxt/
+.expo/
+.web-build/
+*.tsbuildinfo
+
+# ─── Runtime artifacts ────────────────────────────────────────
+logs/
+*.log
+*.pid
+*.tmp
+
+# ─── Backup / scratch ─────────────────────────────────────────
+*.bak
+*.bak[0-9]*
+*.bak-*
+*.save
+*.orig
+*.rej
+=*
+
+# ─── Environment / secrets ────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ─── Runtime data (never track live state) ────────────────────
+data/
+sovereign-core-data/
+cookies/
+*.sqlite
+*.sqlite3
+*.db
+
+# ─── Legacy archives (never re-add) ───────────────────────────
+legacy/
+apps/bridge/
+packages/bridge/
+
+# ─── OS / editors ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.iml
+
+# ─── Termux ───────────────────────────────────────────────────
+.tmp/
+*.deb
+
+# Patch backups — never commit these
+*.before-*
+*.bak.*
+fix_creds.sh
+debug-captures/

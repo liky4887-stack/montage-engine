@@ -1,0 +1,231 @@
+import 'express-async-errors';
+import express, { Express } from 'express';
+import * as http from 'http';
+import { config } from '../config';
+import { log } from '../shared/logger';
+import { authMiddleware } from './middleware/auth';
+import { loggingMiddleware } from './middleware/logging';
+import { errorHandler } from './middleware/errors';
+import healthRouter from './routes/health';
+import executeCommandRouter from './routes/executeCommand';
+import fileOpsRouter from './routes/fileOps';
+import processStatusRouter from './routes/processStatus';
+import { LedgerService } from '../ledger/api/LedgerService';
+import { createLedgerRouter } from '../ledger/http/LedgerHttpRouter';
+import { ProjectService } from '../projects/api/ProjectService';
+import { createProjectRouter } from '../projects/http/ProjectRouter';
+import { TaskService } from '../tasks/api/TaskService';
+import { createTaskRouter } from '../tasks/http/TaskRouter';
+import { AgentService } from '../agents/api/AgentService';
+import { createAgentRouter } from '../agents/http/AgentRouter';
+import { GoalService } from '../goals/api/GoalService';
+import { createGoalRouter } from '../goals/http/GoalRouter';
+import { OfferService } from '../offers/api/OfferService';
+import { createOfferRouter } from '../offers/http/OfferRouter';
+import { SystemPowerService } from '../system-power/api/SystemPowerService';
+import { createSystemPowerRouter } from '../system-power/http/SystemPowerRouter';
+import { GodModeService } from '../god-mode/api/GodModeService';
+import { createGodModeRouter } from '../god-mode/http/GodModeRouter';
+import { MysticRealmService } from '../mystic-realm/api/MysticRealmService';
+import { createMysticRealmRouter } from '../mystic-realm/http/MysticRealmRouter';
+import { IdeService } from '../ide/api/IdeService';
+import { createIdeRouter } from '../ide/http/IdeRouter';
+import { DeepSeekService } from '../deepseek/api/DeepSeekService';
+import { createDeepSeekRouter } from '../deepseek/http/DeepSeekRouter';
+import { createEventsRouter } from '../events/http/EventsRouter';
+import { ChatService } from '../chat/api/ChatService';
+import { createChatRouter } from '../chat/http/ChatRouter';
+import { createAuthDebugRouter } from '../debug/http/AuthDebugRouter';
+import { ProjectBuilder } from '../projects/builder/ProjectBuilder';
+import { ProjectFileStorage } from '../projects/builder/ProjectFileStorage';
+import { createProjectBuildRouter } from '../projects/preview/ProjectBuildRouter';
+import { SkillLoader } from '../skills/SkillLoader';
+import { createSkillsRouter } from '../skills/http/SkillsRouter';
+import { GitHubService } from '../github/api/GitHubService';
+import { createGitHubRouter } from '../github/http/GitHubRouter';
+import { QwenService } from '../qwen/api/QwenService';
+import { createQwenRouter } from '../qwen/http/QwenRouter';
+import { KimiService } from '../kimi/api/KimiService';
+import { createKimiRouter } from '../kimi/http/KimiRouter';
+import { createDeepHatRouter } from '../deephat/http/DeepHatRouter';
+import { DeepHatService } from '../deephat/api/DeepHatService';
+import { EngineRegistry } from '../engines/EngineRegistry';
+import { TwinOrchestrator } from '../engines/TwinOrchestrator';
+import { createEnginesRouter } from '../engines/http/EnginesRouter';
+import bridgeProxyRouter from './routes/bridgeProxy';
+import toolsProxyRouter from './routes/toolsProxy';
+
+export interface TermuxBridgeServerOptions {
+  ledger: LedgerService;
+  projects: ProjectService;
+  tasks: TaskService;
+  agents: AgentService;
+  goals: GoalService;
+  offers: OfferService;
+  systemPower: SystemPowerService;
+  godMode: GodModeService;
+  mysticRealm: MysticRealmService;
+  ide: IdeService;
+  deepseek: DeepSeekService;
+  chat: ChatService;
+  projectBuilder: ProjectBuilder;
+  projectStorage: ProjectFileStorage;
+  skillLoader: SkillLoader;
+  github: GitHubService;
+  qwen: QwenService;
+  kimi: KimiService;
+  deephat: DeepHatService;
+  engineRegistry: EngineRegistry;
+  twinOrchestrator: TwinOrchestrator;
+}
+
+export class TermuxBridgeServer {
+  private app: Express;
+  private server: http.Server | null = null;
+  private ledger: LedgerService;
+  private projects: ProjectService;
+  private tasks: TaskService;
+  private agents: AgentService;
+  private goals: GoalService;
+  private offers: OfferService;
+  private systemPower: SystemPowerService;
+  private godMode: GodModeService;
+  private mysticRealm: MysticRealmService;
+  private ide: IdeService;
+  private deepseek: DeepSeekService;
+  private chat: ChatService;
+  private projectBuilder: ProjectBuilder;
+  private projectStorage: ProjectFileStorage;
+  private skillLoader: SkillLoader;
+  private github: GitHubService;
+  private qwen: QwenService;
+  private kimi: KimiService;
+  private deephat: DeepHatService;
+  private engineRegistry: EngineRegistry;
+  private twinOrchestrator: TwinOrchestrator;
+
+  constructor(opts: TermuxBridgeServerOptions) {
+    this.ledger = opts.ledger;
+    this.projects = opts.projects;
+    this.tasks = opts.tasks;
+    this.agents = opts.agents;
+    this.goals = opts.goals;
+    this.offers = opts.offers;
+    this.systemPower = opts.systemPower;
+    this.godMode = opts.godMode;
+    this.mysticRealm = opts.mysticRealm;
+    this.ide = opts.ide;
+    this.deepseek = opts.deepseek;
+    this.chat = opts.chat;
+    this.projectBuilder = opts.projectBuilder;
+    this.projectStorage = opts.projectStorage;
+    this.skillLoader = opts.skillLoader;
+    this.github = opts.github;
+    this.qwen = opts.qwen;
+    this.kimi = opts.kimi;
+    this.deephat = opts.deephat;
+    this.engineRegistry = opts.engineRegistry;
+    this.twinOrchestrator = opts.twinOrchestrator;
+    this.app = express();
+    this.app.disable('x-powered-by');
+    this.app.use('/bridge', express.raw({ type: '*/*', limit: '20mb' }));
+    this.app.use(express.json({ limit: config.BODY_LIMIT }));
+    this.app.use(loggingMiddleware);
+
+    // Health and process status are unauthenticated for monitoring.
+    this.app.use(healthRouter);
+    this.app.use(processStatusRouter);
+
+    // Everything else requires auth when REQUIRE_AUTH=true.
+    this.app.use(authMiddleware);
+
+    this.app.use(executeCommandRouter);
+    this.app.use(fileOpsRouter);
+    this.app.use(createLedgerRouter(this.ledger));
+    this.app.use(createProjectRouter(this.projects));
+    this.app.use(createTaskRouter(this.tasks));
+    this.app.use(createAgentRouter(this.agents));
+    this.app.use(createGoalRouter(this.goals));
+    this.app.use(createOfferRouter(this.offers));
+    this.app.use(createSystemPowerRouter(this.systemPower));
+    this.app.use(createGodModeRouter(this.godMode));
+    this.app.use(createMysticRealmRouter(this.mysticRealm));
+    this.app.use(createIdeRouter(this.ide));
+    this.app.use('/deepseek', createDeepSeekRouter(this.deepseek));
+    this.app.use('/events', createEventsRouter());
+    this.app.use('/chat', createChatRouter(this.chat));
+    this.app.use('/debug', createAuthDebugRouter());
+    this.app.use('/skills', createSkillsRouter(this.skillLoader));
+    this.app.use('/qwen', createQwenRouter(this.qwen));
+    this.app.use('/kimi', createKimiRouter(this.kimi));
+    this.app.use('/deephad', createDeepHatRouter(this.deephat));
+    this.app.use('/engines', createEnginesRouter(this.engineRegistry, this.twinOrchestrator));
+    this.app.use(createGitHubRouter({
+      github: this.github,
+      storage: this.projectStorage,
+      projects: this.projects,
+    }));
+    this.app.use('/projects', createProjectBuildRouter({
+      builder: this.projectBuilder,
+      storage: this.projectStorage,
+      publicBaseUrl: config.PUBLIC_BASE_URL,
+    }));
+    this.app.use(bridgeProxyRouter);
+    this.app.use(toolsProxyRouter);
+
+    this.app.use(errorHandler);
+  }
+
+  getExpressApp(): Express {
+    return this.app;
+  }
+
+  async start(): Promise<void> {
+    await this.ledger.init();
+    await this.projects.init();
+    await this.tasks.init();
+    await this.agents.init();
+    await this.goals.init();
+    await this.offers.init();
+    await this.systemPower.init();
+    await this.godMode.init();
+    await this.mysticRealm.init();
+    await this.ide.init();
+    await this.chat.init();
+
+    return new Promise((resolve) => {
+      this.server = this.app.listen(config.BRIDGE_PORT, config.HOST, async () => {
+        await this.ledger.append({
+          type: 'SERVER_START',
+          source: 'termux-bridge',
+          payload: {
+            host: config.HOST,
+            port: config.BRIDGE_PORT,
+            requireAuth: config.REQUIRE_AUTH,
+            allowedCommands: config.ALLOWED_COMMANDS.length,
+            allowedPaths: config.ALLOWED_PATHS,
+            deepseekWasmPresent: this.deepseek ? true : false,
+          },
+          tags: ['bridge', 'startup'],
+        });
+        log.info('termux.bridge.listening', {
+          url: 'http://' + config.HOST + ':' + config.BRIDGE_PORT,
+        });
+        resolve();
+      });
+    });
+  }
+
+  async stop(signal: string): Promise<void> {
+    if (!this.server) return;
+    await this.ledger.append({
+      type: 'SERVER_STOP',
+      source: 'termux-bridge',
+      payload: { signal },
+      tags: ['bridge', 'shutdown'],
+    });
+    return new Promise((resolve) => {
+      this.server!.close(() => resolve());
+    });
+  }
+}

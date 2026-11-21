@@ -1,0 +1,676 @@
+import { tlsFetch } from '../../shared/tlsFetch';
+import { CredentialStore } from '../storage/CredentialStore';
+import { PowSolver } from '../pow/PowSolver';
+import {
+  CallDeepSeekOptions,
+  DeepSeekApiResponse,
+  DeepSeekMessage,
+  DeepSeekServiceOptions,
+  PathToken,
+  PowChallenge,
+  StreamChunk,
+} from '../models/DeepSeekTypes';
+import {
+  DeepSeekApiError,
+  DeepSeekAuthError,
+  DeepSeekNoCredentialsError,
+} from '../models/DeepSeekErrors';
+import { dispatchChatCommand } from '../../engines/CommandRouter';
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+let _eniCache: string | null = null;
+function getEniPrompt(): string {
+  if (_eniCache !== null) return _eniCache;
+  try {
+    _eniCache = readFileSync(join(homedir(), 'prompts', 'eni-identity.md'), 'utf-8').trim();
+  } catch { _eniCache = ''; }
+  return _eniCache;
+}
+
+
+
+/**
+ * DeepSeek streams JSON-Patch style SSE frames. Three shapes:
+ *   1. Initial:  {"v":{"response":{"fragments":[{"content":"Hello"}]}}}
+ *   2. Patch:    {"p":"response/fragments/-1/content","o":"APPEND","v":" there"}
+ *   3. Bare:     {"v":" how"}  -- continues the last active content path
+ *
+ * The helper below tracks a running text buffer across frames. It returns
+ * the delta produced by the current payload (empty string if nothing added).
+ */
+interface SseState {
+  text: string;
+  thinking: string;
+  lastPath: string | null;
+  currentType: 'THINK' | 'RESPONSE' | null;
+}
+
+function applySsePayload(payload: string, state: SseState): string {
+  if (!payload || payload === '[DONE]') return '';
+
+  let j: any;
+  try { j = JSON.parse(payload); } catch { return ''; }
+
+  const before = state.text.length;
+
+  // Case 1: initial frame with fragments array.
+  if (j.v && typeof j.v === 'object' && j.v.response) {
+    const frags = j.v.response.fragments;
+    if (Array.isArray(frags)) {
+      for (const fr of frags) {
+        if (!fr) continue;
+        const t: 'THINK' | 'RESPONSE' = fr.type === 'THINK' ? 'THINK' : 'RESPONSE';
+        state.currentType = t;
+        if (typeof fr.content === 'string' && fr.content.length > 0) {
+          if (t === 'RESPONSE') state.text += fr.content;
+          else state.thinking += fr.content;
+        }
+      }
+    }
+    state.lastPath = 'response/fragments/-1/content';
+    return state.text.slice(before);
+  }
+
+  // Case 2a: whole new fragment appended to the array.
+  if (j.p === 'response/fragments' && j.o === 'APPEND' && Array.isArray(j.v)) {
+    for (const fr of j.v) {
+      if (!fr) continue;
+      const t: 'THINK' | 'RESPONSE' = fr.type === 'THINK' ? 'THINK' : 'RESPONSE';
+      state.currentType = t;
+      if (typeof fr.content === 'string' && fr.content.length > 0) {
+        if (t === 'RESPONSE') state.text += fr.content;
+        else state.thinking += fr.content;
+      }
+    }
+    state.lastPath = 'response/fragments/-1/content';
+    return state.text.slice(before);
+  }
+
+  // Case 2b: explicit JSON patch to a content path.
+  if (typeof j.p === 'string' && typeof j.o === 'string') {
+    if (j.p.endsWith('/content') && typeof j.v === 'string') {
+      if (state.currentType === 'THINK') {
+        if (j.o === 'APPEND') state.thinking += j.v;
+        else if (j.o === 'SET') state.thinking = j.v;
+      } else {
+        if (j.o === 'APPEND') state.text += j.v;
+        else if (j.o === 'SET') state.text = j.v;
+      }
+      state.lastPath = j.p;
+    }
+    return state.text.slice(before);
+  }
+
+  // Case 3: bare continuation {v: "..."} — append to last active content path.
+  if (typeof j.v === 'string' && state.lastPath && state.lastPath.endsWith('/content')) {
+    if (state.currentType === 'THINK') state.thinking += j.v;
+    else state.text += j.v;
+    return state.text.slice(before);
+  }
+
+  return '';
+}
+
+export class DeepSeekService {
+  private _accessToken: string | null = null;
+  private _accessTokenExpiresAt = 0;
+
+  private static readonly MAX_TURNS_PER_SESSION = 5;
+  // Global pacing: serialize every DeepSeek call and enforce a minimum
+  // gap between consecutive calls. DeepSeek's per-account rate limit
+  // trips at ~10 calls in 20s regardless of session id; 2500ms gives us
+  // 12 per 30s, safely under the ceiling.
+  private static readonly MIN_CALL_GAP_MS =
+    Number(process.env.DEEPSEEK_MIN_CALL_GAP_MS ?? 5000);
+  private callChain: Promise<void> = Promise.resolve();
+  private lastCallAt = 0;
+
+  private async withCallSlot<T>(fn: () => Promise<T>): Promise<T> {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const prev = this.callChain;
+    this.callChain = prev.then(() => gate);
+    await prev;
+    try {
+      const wait = this.lastCallAt + DeepSeekService.MIN_CALL_GAP_MS - Date.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      this.lastCallAt = Date.now();
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private readonly pathTokens = new Map<string, PathToken>();
+  private lastChatAt: number | null = null;
+  private lastChatOk: boolean | null = null;
+  private lastChatError: string | null = null;
+
+  constructor(
+    private readonly creds: CredentialStore,
+    private readonly pow: PowSolver,
+    private readonly opts: DeepSeekServiceOptions,
+  ) {}
+
+  setCredentials(input: {
+    bearerToken: string; cookies: string;
+    hifLeim?: string; hifDliq?: string; deviceId?: string;
+  }): { bearerToken: string; cookies: string } {
+    const stored = this.creds.set(input);
+    this.pathTokens.clear();
+    return { bearerToken: stored.bearerToken, cookies: stored.cookies };
+  }
+
+  clearCredentials(): void { this.creds.clear(); this.pathTokens.clear(); }
+  hasCredentials(): boolean { return this.creds.has(); }
+
+  getCredentialsRedacted(): {
+    configured: boolean; bearerLength: number; cookiesLength: number;
+    hasHifLeim: boolean; hasHifDliq: boolean; hasDeviceId: boolean;
+    acquiredAt: number | null;
+  } {
+    const c = this.creds.get();
+    if (!c) return {
+      configured: false, bearerLength: 0, cookiesLength: 0,
+      hasHifLeim: false, hasHifDliq: false, hasDeviceId: false, acquiredAt: null,
+    };
+    return {
+      configured: true,
+      bearerLength: c.bearerToken.length,
+      cookiesLength: c.cookies.length,
+      hasHifLeim: !!c.hifLeim,
+      hasHifDliq: !!c.hifDliq,
+      hasDeviceId: !!c.deviceId,
+      acquiredAt: c.acquiredAt,
+    };
+  }
+
+  private requireCreds() {
+    const c = this.creds.get();
+    if (!c) throw new DeepSeekNoCredentialsError();
+    return c;
+  }
+
+  private buildHeaders(extra?: Record<string, string>): Record<string, string> {
+    const c = this.requireCreds();
+    const h: Record<string, string> = {
+      'content-type': 'application/json',
+      'accept': '*/*',
+      'accept-language': 'en-US',
+      'authorization': `Bearer ${c.bearerToken}`,
+      'cookie': c.cookies,
+      'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+      'origin': this.opts.baseUrl,
+      'referer': `${this.opts.baseUrl}/`,
+      'priority': 'u=1, i',
+      'sec-ch-ua': '"Chromium";v="127", "Not)A;Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Linux"',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin',
+      'x-client-bundle-id': 'com.deepseek.chat',
+      'x-client-locale': 'en_US',
+      'x-client-platform': 'web',
+      'x-client-timezone-offset': '7200',
+      'x-client-version': '2.5.0',
+    };
+    if (c.deviceId) h['x-device-id'] = c.deviceId;
+    if (c.hifLeim) h['x-hif-leim'] = c.hifLeim;
+    if (c.hifDliq) h['x-hif-dliq'] = c.hifDliq;
+    if (extra) Object.assign(h, extra);
+    return h;
+  }
+
+  private async fetchJson(path: string, init: RequestInit): Promise<{ response: Response; json: DeepSeekApiResponse }> {
+    const url = path.startsWith('http') ? path : this.opts.baseUrl + path;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await tlsFetch(url, { ...init, signal: init.signal ?? controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    const text = await response.text();
+    let json: DeepSeekApiResponse;
+    try { json = JSON.parse(text); }
+    catch { throw new DeepSeekApiError(-1, `Non-JSON response (${response.status}): ${text.slice(0, 200)}`, response.status); }
+    return { response, json };
+  }
+
+  private async createPowChallenge(targetPath: string): Promise<PowChallenge> {
+    const { json } = await this.fetchJson('/api/v0/chat/create_pow_challenge', {
+      method: 'POST',
+      headers: this.buildHeaders(),
+      body: JSON.stringify({ target_path: targetPath }),
+    });
+    if (json.code !== 0) {
+      if (json.code === 40002 || json.code === 40003) throw new DeepSeekAuthError(json.code, json.msg);
+      throw new DeepSeekApiError(json.code, json.msg, 200);
+    }
+    const chal = (json.data as any).biz_data.challenge;
+    return {
+      challenge: chal.challenge,
+      salt: chal.salt,
+      expireAt: chal.expire_at,
+      difficulty: chal.difficulty,
+      signature: chal.signature,
+      algorithm: chal.algorithm || 'DeepSeekHashV1',
+    };
+  }
+
+  private buildPowHeader(pow: PowChallenge, answer: number, targetPath: string): string {
+    const payload = JSON.stringify({
+      algorithm: pow.algorithm,
+      challenge: pow.challenge,
+      salt: pow.salt,
+      answer,
+      signature: pow.signature,
+      target_path: targetPath,
+    });
+    return Buffer.from(payload, 'utf8').toString('base64');
+  }
+
+  private async createChatSession(pow: PowChallenge, answer: number, targetPath: string): Promise<string> {
+    const { json } = await this.fetchJson('/api/v0/chat_session/create', {
+      method: 'POST',
+      headers: this.buildHeaders(),
+      body: JSON.stringify({
+        challenge: pow.challenge,
+        target_path: targetPath,
+        salt: pow.salt,
+        answer: String(answer),
+        signature: pow.signature,
+      }),
+    });
+    if (json.code !== 0) {
+      if (json.code === 40002 || json.code === 40003) throw new DeepSeekAuthError(json.code, json.msg);
+      throw new DeepSeekApiError(json.code, json.msg, 200);
+    }
+    const biz = (json.data as any).biz_data;
+    const sessionId = biz && biz.chat_session && biz.chat_session.id;
+    if (!sessionId) throw new DeepSeekApiError(-1, 'chat_session/create returned no id', 200);
+    return sessionId;
+  }
+
+  async refreshPathToken(targetPath?: string, force = false): Promise<{ token: string; expiresAt: number }> {
+    const path = targetPath ?? this.opts.defaultTargetPath;
+    if (!force) {
+      const cached = this.pathTokens.get(path);
+      if (
+        cached &&
+        cached.expiresAt > Date.now() &&
+        cached.turns < DeepSeekService.MAX_TURNS_PER_SESSION
+      ) {
+        return { token: cached.token, expiresAt: cached.expiresAt };
+      }
+    }
+    const ch = await this.createPowChallenge(path);
+    const answer = await this.pow.solve(ch.challenge, ch.salt, ch.expireAt, ch.difficulty);
+    const sessionId = await this.createChatSession(ch, answer, path);
+    const expiresAt = Date.now() + (this.opts.pathTokenTtlSafetyMs ?? 30_000);
+    this.pathTokens.set(path, {
+      targetPath: path,
+      token: sessionId,
+      expiresAt,
+      turns: 0,
+      createdAt: Date.now(),
+    });
+    return { token: sessionId, expiresAt };
+  }
+
+  private bumpTurns(targetPath: string, sessionId: string): void {
+    const entry = this.pathTokens.get(targetPath);
+    if (entry && entry.token === sessionId) entry.turns += 1;
+  }
+
+  listCachedPathTokens(): PathToken[] {
+    return Array.from(this.pathTokens.values()).map((t) => ({ ...t }));
+  }
+
+  private promptFromInput(input: string | DeepSeekMessage[]): string {
+    if (typeof input === 'string') return input;
+    if (!Array.isArray(input) || input.length === 0) {
+      throw new DeepSeekApiError(-1, 'messages must be a non-empty array', 0);
+    }
+    const last = input.filter((m) => m.role === 'user').pop();
+    return last ? last.content : input[input.length - 1].content;
+  }
+
+  private buildBody(sessionId: string, prompt: string, options: CallDeepSeekOptions): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      chat_session_id: sessionId,
+      parent_message_id: options.parentMessageId ?? null,
+      model_type: options.modelType ?? null,
+      prompt,
+      ref_file_ids: [],
+      thinking_enabled: options.thinkingEnabled ?? false,
+      search_enabled: options.searchEnabled ?? false,
+      action: null,
+      preempt: false,
+    };
+    if (typeof options.temperature === 'number') body.temperature = options.temperature;
+    if (typeof options.maxTokens === 'number') body.max_tokens = options.maxTokens;
+    return body;
+  }
+
+
+  private async getValidAccessToken(): Promise<string> {
+    if (this._accessToken && Date.now() < this._accessTokenExpiresAt) {
+      return this._accessToken;
+    }
+    const __c = this.creds.get();
+    let userToken: string | null = null;
+    try {
+      const __credPath = process.env.DEEPSEEK_CREDENTIALS_FILE || join(homedir(), 'cookies', 'deepseek-creds.json');
+      const __raw = JSON.parse(readFileSync(__credPath, 'utf-8')) as any;
+      userToken = __raw?.userToken || __raw?.bearerToken || null;
+    } catch { /* fall through to store */ }
+    if (!userToken) userToken = __c?.bearerToken ?? null;
+    if (!userToken) throw new Error('DeepSeek userToken missing — re-extract from chat.deepseek.com localStorage');
+
+    const res = await tlsFetch('https://chat.deepseek.com/api/v0/users/current', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${userToken}`,
+        'Cookie': (__c?.cookies) || '',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
+      },
+    });
+
+    const json = await res.json() as any;
+    if (json.code === 40003) throw new Error('DeepSeek userToken invalid/expired — re-extract from chat.deepseek.com localStorage');
+    if (json.code === 40002) throw new Error('DeepSeek userToken missing — provide one via POST /deepseek/credentials');
+    if (json.code !== 0) throw new Error(`DeepSeek /users/current failed: code=${json.code} msg=${json.msg}`);
+
+    const accessToken = json?.data?.biz_data?.token;
+    if (!accessToken) throw new Error('DeepSeek /users/current returned no token');
+
+    this._accessToken = accessToken;
+    this._accessTokenExpiresAt = Date.now() + 3_600_000;
+    return accessToken;
+  }
+
+  async callDeepSeek(input: string | DeepSeekMessage[], options: CallDeepSeekOptions = {}): Promise<DeepSeekApiResponse> {
+    return this.withCallSlot(() => this._callDeepSeekWithRetry(input, options));
+  }
+
+  private async _callDeepSeekWithRetry(
+    input: string | DeepSeekMessage[],
+    options: CallDeepSeekOptions,
+  ): Promise<DeepSeekApiResponse> {
+    const maxRetries = Number(process.env.DEEPSEEK_MAX_RETRIES ?? 3);
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await this._callDeepSeekInner(input, options);
+      } catch (e) {
+        lastErr = e;
+        const msg = String((e as any)?.message ?? '');
+        const isRateLimit =
+          msg.includes('zero content') ||
+          msg.includes('empty completion') ||
+          msg.includes('session likely exhausted');
+        if (!isRateLimit || attempt === maxRetries - 1) throw e;
+        // Long backoff on rate limit — gives DeepSeek's sliding window
+        // time to drain. 20s, 40s, 60s.
+        const backoffMs = Math.min(60000, 20000 * Math.pow(2, attempt));
+        console.warn(
+          `[deepseek] rate-limit detected (attempt ${attempt + 1}/${maxRetries}), waiting ${backoffMs/1000}s before retry`
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+    }
+    throw lastErr ?? new Error('deepseek call failed');
+  }
+
+  private async _callDeepSeekInner(input: string | DeepSeekMessage[], options: CallDeepSeekOptions = {}): Promise<DeepSeekApiResponse> {
+    // Refresh access token before every call — userToken is a refresh token.
+    const freshToken = await this.getValidAccessToken();
+    const __cc = this.creds.get();
+    if (__cc) {
+      this.creds.set({
+        bearerToken: freshToken,
+        cookies: __cc.cookies,
+        hifLeim: __cc.hifLeim,
+        hifDliq: __cc.hifDliq,
+        deviceId: __cc.deviceId,
+      });
+    }
+
+    const targetPath = options.targetPath ?? this.opts.defaultTargetPath;
+    const rawPrompt = this.promptFromInput(input);
+    const eni = getEniPrompt();
+    const prompt = eni ? `${eni}\n\n---\n\nUser: ${rawPrompt}` : rawPrompt;
+
+    const correlation_id = 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const dispatch = await dispatchChatCommand(options.rawPrompt ?? prompt, correlation_id);
+    if (dispatch.matched) {
+      return {
+        code: 0,
+        msg: '',
+        data: { content: dispatch.content || '', chat_session_id: null, message_id: null },
+      };
+    }
+
+    const ch = await this.createPowChallenge(targetPath);
+    const answer = await this.pow.solve(ch.challenge, ch.salt, ch.expireAt, ch.difficulty);
+    const powHeader = this.buildPowHeader(ch, answer, targetPath);
+
+    // Always open a fresh session. DeepSeek accumulates server-side
+    // context per session_id, and with 3 concurrent units sending
+    // 12-20KB prompts (evidence_report, tool results), the accumulated
+    // buffer crosses the ceiling after ~10 total turns. The mobile
+    // already sends the full transcript inline, so no context is lost
+    // by starting fresh each call. Throttle (2.5s gap) keeps session
+    // creation rate well under DeepSeek's session-creation limit.
+    const sessionId = options.chatSessionId
+      ?? (await this.refreshPathToken(targetPath, true)).token;
+
+    const url = targetPath.startsWith('http') ? targetPath : this.opts.baseUrl + targetPath;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+
+    let response: Response;
+    try {
+      response = await tlsFetch(url, {
+        method: 'POST',
+        headers: this.buildHeaders({ 'x-ds-pow-response': powHeader, 'accept': 'text/event-stream' }),
+        body: JSON.stringify(this.buildBody(sessionId, prompt, options)),
+        signal: options.signal ?? controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!response.ok || !response.body) {
+      const text = await response.text().catch(() => '');
+      this.lastChatAt = Date.now();
+      this.lastChatOk = false;
+      this.lastChatError = 'HTTP ' + response.status;
+      throw new DeepSeekApiError(-1, 'HTTP ' + response.status + ': ' + text.slice(0, 300), response.status);
+    }
+
+    
+const state: SseState = { text: '', thinking: '', lastPath: null, currentType: null };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let idx: number;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload) continue;
+          applySsePayload(payload, state);
+        }
+      }
+    }
+    try { reader.releaseLock(); } catch (_) {}
+
+    // Silent-empty guard. DeepSeek returns HTTP 200 with zero content
+    // frames when the session has been poisoned. Turn that into a real
+    // error so retry layers upstream actually see it.
+    if (state.text.trim().length === 0) {
+      // Rate-limited or context-poisoned. Drop the cached session so the
+      // next call gets a fresh one instead of retrying the same dead token.
+      this.pathTokens.delete(targetPath);
+      this.lastChatAt = Date.now();
+      this.lastChatOk = false;
+      this.lastChatError = 'empty completion (session context exhausted)';
+      throw new DeepSeekApiError(
+        -1,
+        'DeepSeek returned HTTP 200 with zero content — session likely exhausted',
+        200,
+      );
+    }
+
+    this.lastChatAt = Date.now();
+    this.lastChatOk = true;
+    this.lastChatError = null;
+
+    // Rotate session before it hits DeepSeek's context ceiling.
+    this.bumpTurns(targetPath, sessionId);
+
+    return {
+      code: 0,
+      msg: '',
+      data: {
+        content: state.text,
+        chat_session_id: sessionId,
+        message_id: null,
+      },
+    };
+  }
+
+  async *streamDeepSeek(input: string | DeepSeekMessage[], options: CallDeepSeekOptions = {}): AsyncGenerator<StreamChunk, void, unknown> {
+    const targetPath = options.targetPath ?? this.opts.defaultTargetPath;
+    const prompt = this.promptFromInput(input);
+
+    const ch = await this.createPowChallenge(targetPath);
+    const answer = await this.pow.solve(ch.challenge, ch.salt, ch.expireAt, ch.difficulty);
+    const powHeader = this.buildPowHeader(ch, answer, targetPath);
+
+    // Always open a fresh session. DeepSeek accumulates server-side
+    // context per session_id, and with 3 concurrent units sending
+    // 12-20KB prompts (evidence_report, tool results), the accumulated
+    // buffer crosses the ceiling after ~10 total turns. The mobile
+    // already sends the full transcript inline, so no context is lost
+    // by starting fresh each call. Throttle (2.5s gap) keeps session
+    // creation rate well under DeepSeek's session-creation limit.
+    const sessionId = options.chatSessionId
+      ?? (await this.refreshPathToken(targetPath, true)).token;
+
+    const url = targetPath.startsWith('http') ? targetPath : this.opts.baseUrl + targetPath;
+    const response = await tlsFetch(url, {
+      method: 'POST',
+      headers: this.buildHeaders({ 'x-ds-pow-response': powHeader, 'accept': 'text/event-stream' }),
+      body: JSON.stringify(this.buildBody(sessionId, prompt, options)),
+      signal: options.signal,
+    });
+
+    if (!response.ok || !response.body) {
+      const text = await response.text().catch(() => '');
+      yield { type: 'error', error: `HTTP ${response.status}: ${text.slice(0, 300)}` };
+      return;
+    }
+
+    const state: SseState = { text: '', thinking: '', lastPath: null, currentType: null };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let idx: number;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            if (payload === '[DONE]') { yield { type: 'done' }; return; }
+            const delta = applySsePayload(payload, state);
+            if (delta) yield { type: 'chunk', content: delta, raw: payload };
+          }
+        }
+      }
+      yield { type: 'done' };
+    } catch (err) {
+      yield { type: 'error', error: err instanceof Error ? err.message : String(err) };
+    } finally {
+      try { reader.releaseLock(); } catch { /* noop */ }
+    }
+  }
+
+  async verifyCredentials(): Promise<{ ok: boolean; code: number; msg: string }> {
+    const { json } = await this.fetchJson('/api/v0/users/current', { method: 'GET', headers: this.buildHeaders() });
+    return { ok: json.code === 0, code: json.code, msg: json.msg };
+  }
+
+  async healthCheck(): Promise<{
+    credentialsConfigured: boolean;
+    bearerLength: number;
+    cookiesLength: number;
+    hasHifLeim: boolean;
+    hasHifDliq: boolean;
+    hasDeviceId: boolean;
+    acquiredAt: number | null;
+    powWasmPresent: boolean;
+    powWasmLoaded: boolean;
+    cachedPathTokens: number;
+    bearerValid: boolean | null;
+    lastError?: string;
+    lastChatAt: number | null;
+    lastChatOk: boolean | null;
+    lastChatError: string | null;
+  }> {
+    const c = this.getCredentialsRedacted();
+    const out = {
+      credentialsConfigured: c.configured,
+      bearerLength: c.bearerLength,
+      cookiesLength: c.cookiesLength,
+      hasHifLeim: c.hasHifLeim,
+      hasHifDliq: c.hasHifDliq,
+      hasDeviceId: c.hasDeviceId,
+      acquiredAt: c.acquiredAt,
+      powWasmPresent: this.pow.wasmExists(),
+      powWasmLoaded: this.pow.isReady(),
+      cachedPathTokens: this.pathTokens.size,
+      bearerValid: null as boolean | null,
+      lastError: undefined as string | undefined,
+      lastChatAt: this.lastChatAt,
+      lastChatOk: this.lastChatOk,
+      lastChatError: this.lastChatError,
+    };
+    if (!c.configured) return out;
+    try {
+      const v = await this.verifyCredentials();
+      out.bearerValid = v.ok;
+      if (!v.ok) out.lastError = `${v.code} ${v.msg}`;
+    } catch (err) {
+      out.bearerValid = false;
+      out.lastError = err instanceof Error ? err.message : String(err);
+    }
+    return out;
+  }
+}
