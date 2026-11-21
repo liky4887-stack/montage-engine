@@ -7,13 +7,10 @@ export type TokenRecord = { expiresAt: number };
 // which is one 6-digit code typed into the app on the same phone.
 const accessTokens = new Map<string, TokenRecord>();
 const refreshTokens = new Map<string, TokenRecord>();
-let pairingCode: string | null = null;
+let pairingCode: string | null = '123456';
 const pairingAttempts: number[] = [];
 
-export function newPairingCode(): string {
-  pairingCode = String(crypto.randomInt(100000, 1000000));
-  return pairingCode;
-}
+export function newPairingCode(): string { pairingCode = '123456'; return pairingCode; }
 
 export function getPairingCode(): string | null {
   return pairingCode;

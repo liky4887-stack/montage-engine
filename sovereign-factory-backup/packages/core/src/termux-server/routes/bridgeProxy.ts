@@ -3,7 +3,6 @@ import * as http from 'http';
 
 const UPSTREAM_HOST = '127.0.0.1';
 const UPSTREAM_PORT = parseInt(process.env.BRIDGE_UPSTREAM_PORT || '8787', 10);
-
 const router = Router();
 
 router.options('/bridge/*', (_req: Request, res: Response) => {
@@ -15,7 +14,7 @@ router.options('/bridge/*', (_req: Request, res: Response) => {
 
 router.all('/bridge/*', (req: Request, res: Response) => {
   const stripped = req.originalUrl.replace(/^\/bridge/, '') || '/';
-
+  
   const headers: http.OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (k === 'host' || k === 'connection' || k === 'content-length') continue;
@@ -48,24 +47,16 @@ router.all('/bridge/*', (req: Request, res: Response) => {
     }
   });
 
-  // For multipart, stream directly and let Node set chunked encoding
-  const isMultipart = req.headers['content-type']?.includes('multipart/form-data');
-  if (isMultipart) {
-    req.pipe(proxyReq);
-  } else {
-    // For JSON, buffer and forward
-    let bodyBuffer: Buffer | undefined;
-    if (Buffer.isBuffer(req.body)) {
-      bodyBuffer = req.body;
-    } else if (req.body && typeof req.body === 'object') {
-      bodyBuffer = Buffer.from(JSON.stringify(req.body));
-    }
-    if (bodyBuffer && bodyBuffer.length) {
-      headers['content-length'] = String(bodyBuffer.length);
-      headers['content-type'] = 'application/json';
-      proxyReq.write(bodyBuffer);
-    }
+  // If Express parsed the JSON, send it as a string
+  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+    const bodyData = JSON.stringify(req.body);
+    headers['content-type'] = 'application/json';
+    headers['content-length'] = Buffer.byteLength(bodyData);
+    proxyReq.write(bodyData);
     proxyReq.end();
+  } else {
+    // Otherwise (multipart), pipe the stream
+    req.pipe(proxyReq);
   }
 });
 
