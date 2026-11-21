@@ -373,7 +373,7 @@ export class DeepSeekService {
     if (!userToken) userToken = __c?.bearerToken ?? null;
     if (!userToken) throw new Error('DeepSeek userToken missing — re-extract from chat.deepseek.com localStorage');
 
-    const res = await tlsFetch('https://api.openai.com/api/v0/users/current', {
+    const res = await tlsFetch('http://127.0.0.1:5005/api/v0/users/current', {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${userToken}`,

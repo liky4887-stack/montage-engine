@@ -60,7 +60,7 @@ export const config = Object.freeze({
   BODY_LIMIT: env('BODY_LIMIT', '2mb'),
   DATA_DIR,
   DEEPSEEK: {
-    baseUrl: env('DEEPSEEK_BASE_URL', 'https://api.openai.com').replace(/\/+$/, ''),
+    baseUrl: env('DEEPSEEK_BASE_URL', 'http://127.0.0.1:5005').replace(/\/+$/, ''),
     defaultTargetPath: env('DEEPSEEK_DEFAULT_TARGET', '/v1/chat/completions'),
     defaultModel: env('DEEPSEEK_DEFAULT_MODEL', 'deepseek-chat'),
     requestTimeoutMs: envInt('DEEPSEEK_REQUEST_TIMEOUT_MS', 60000),
